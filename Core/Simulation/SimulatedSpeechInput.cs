@@ -111,6 +111,15 @@ public sealed class SimulatedSpeechInput : IDisposable
             _onFrame((float[])frame.Clone(), rms);
             await Task.Delay(20, token).ConfigureAwait(false);
         }
+
+        // 补 600ms 静音，让 VAD 正常收尾、电平回落
+        var silence = new float[FrameSamples];
+        for (int i = 0; i < 30; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            _onFrame(silence, 0);
+            await Task.Delay(20, token).ConfigureAwait(false);
+        }
     }
 
     private static float[] DecodeTo16kMono(byte[] wav)

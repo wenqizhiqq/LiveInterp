@@ -19,30 +19,23 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         _viewModel = DataContext as MainViewModel;
-        if (_viewModel != null)
-            _viewModel.Segments.CollectionChanged += OnSegmentsChanged;
+        if (_viewModel == null) return;
+
+        _viewModel.ChatMessages.CollectionChanged += OnChatMessagesChanged;
+        _viewModel.AutoStart();
+        CommandBox.Focus();
     }
 
-    private void OnSegmentsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    private void OnChatMessagesChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
         if (e.Action != NotifyCollectionChangedAction.Add) return;
-        Dispatcher.BeginInvoke(new Action(() =>
-        {
-            if (SubtitleList.Items.Count > 0)
-                SubtitleList.ScrollIntoView(SubtitleList.Items[^1]);
-        }), DispatcherPriority.Background);
-    }
-
-    private void ApiKeyBox_PasswordChanged(object sender, RoutedEventArgs e)
-    {
-        if (DataContext is MainViewModel viewModel)
-            viewModel.ApiKey = ApiKeyBox.Password;
+        Dispatcher.BeginInvoke(new Action(() => ChatScroll.ScrollToEnd()), DispatcherPriority.Background);
     }
 
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
         if (_viewModel != null)
-            _viewModel.Segments.CollectionChanged -= OnSegmentsChanged;
+            _viewModel.ChatMessages.CollectionChanged -= OnChatMessagesChanged;
         _viewModel?.Shutdown();
         _viewModel = null;
     }

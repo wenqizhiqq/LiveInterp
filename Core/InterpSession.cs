@@ -200,6 +200,30 @@ public sealed class InterpSession : IDisposable
 
     public void SetVolume(float volume) => _player.SetVolume(volume);
 
+    /// <summary>聊天框输入的文字直接离线翻译，不经过麦克风，也不朗读。</summary>
+    public async Task<(TranslationResult? Result, string SourceLanguage)> TranslateTextAsync(
+        string text, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return (null, _options.SourceCode);
+
+        string language = _autoLanguage
+            ? (ContainsChinese(text) ? "zh" : "en")
+            : _options.SourceCode;
+
+        ITranslator? translator = language == "zh" ? _translatorZhEn : _translatorEnZh;
+        if (translator == null) return (null, language);
+
+        var result = await translator.TranslateAsync(text.Trim(), token).ConfigureAwait(false);
+        return (result, language);
+    }
+
+    private static bool ContainsChinese(string text)
+    {
+        foreach (char ch in text)
+            if (ch >= '\u4e00' && ch <= '\u9fff') return true;
+        return false;
+    }
+
     // —— 采集与分段 ——
 
     private void OnFrame(float[] frame, float rms)

@@ -1,8 +1,10 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Speech.Synthesis;
+using System.Text;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -84,6 +86,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private bool _micWarningShown;
     private DateTime _lastBargeToast = DateTime.UtcNow.AddMinutes(-1);
 
+    private readonly Dictionary<InterpSegment, ChatMessage> _chatBySegment = new();
+    private string _commandText = string.Empty;
+    private bool _restarting;
+    private bool _autoStarted;
+    private bool _simulationTestRunning;
+    private bool _testingSimulation;
+
     public MainViewModel()
     {
         _dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
@@ -93,17 +102,20 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Voices = new ObservableCollection<VoiceOption>();
         Segments = new ObservableCollection<InterpSegment>();
         Toasts = new ObservableCollection<ToastMessage>();
+        ChatMessages = new ObservableCollection<ChatMessage>();
 
-        _simulationMode = Environment.GetEnvironmentVariable("LIVEINTERP_SIM") == "1";
-        if (Environment.GetEnvironmentVariable("LIVEINTERP_DIRECTION") == "1")
-            _directionIndex = 1;
+        _simulationMode = false;
 
-        Segments.CollectionChanged += (_, _) => CommandManager.InvalidateRequerySuggested();
+        Segments.CollectionChanged += OnSegmentsChanged;
 
         StartCommand = new RelayCommand(Start, () => !IsRunning && !IsStopping);
         StopCommand = new RelayCommand(Stop, () => IsRunning);
         ClearCommand = new RelayCommand(() => Segments.Clear(), () => Segments.Count > 0);
         RefreshDevicesCommand = new RelayCommand(RefreshDevices, () => !IsRunning && !IsStopping);
+        SendCommand = new RelayCommand(() => _ = SendAsync(),
+            () => !string.IsNullOrWhiteSpace(CommandText));
+        SimulationTestCommand = new RelayCommand(() => _ = RunSimulationTestAsync(),
+            () => !_simulationTestRunning && !IsStopping && !_restarting);
 
         _meterTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -122,12 +134,31 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public ObservableCollection<OutputDevice> OutputDevices { get; }
     public ObservableCollection<VoiceOption> Voices { get; }
     public ObservableCollection<ToastMessage> Toasts { get; }
+    public ObservableCollection<ChatMessage> ChatMessages { get; }
 
     // —— 命令 ——
     public ICommand StartCommand { get; }
     public ICommand StopCommand { get; }
     public ICommand ClearCommand { get; }
     public ICommand RefreshDevicesCommand { get; }
+    public ICommand SendCommand { get; }
+    public ICommand SimulationTestCommand { get; }
+
+    public bool IsSimulationTestRunning => _simulationTestRunning;
+
+    public string SimulationTestButtonText => _simulationTestRunning ? "测试中…" : "模拟测试";
+
+    private bool IsSimulatedSession => SimulationMode || _testingSimulation;
+
+    public string CommandText
+    {
+        get => _commandText;
+        set
+        {
+            if (!SetField(ref _commandText, value)) return;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
 
     // —— 运行状态 ——
     public bool IsRunning
@@ -331,7 +362,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set
         {
             if (!SetField(ref _volume, value)) return;
-            if (!SimulationMode) _session?.SetVolume((float)value);
+            if (!IsSimulatedSession) _session?.SetVolume((float)value);
         }
     }
 
@@ -341,7 +372,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set
         {
             if (!SetField(ref _isMuted, value)) return;
-            if (!SimulationMode) _session?.SetMuted(value);
+            if (!IsSimulatedSession) _session?.SetMuted(value);
         }
     }
 
@@ -403,7 +434,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             string mode = AutoLanguage && !IsOnline ? "自动中/英" : DirectionLabel;
             string diar = Diarization && !IsOnline ? " · 声纹分人" : string.Empty;
-            string sim = SimulationMode ? " · 模拟输入" : string.Empty;
+            string sim = _simulationTestRunning
+                ? " · 模拟测试"
+                : SimulationMode ? " · 模拟输入" : string.Empty;
             return $"{mode} · {EngineChip} · 人声打断{diar}{sim}";
         }
     }
@@ -572,6 +605,446 @@ public sealed class MainViewModel : INotifyPropertyChanged
         ShowToast("设备列表已刷新。", "ok");
     }
 
+    // —— 聊天与命令 ——
+    private void OnSegmentsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.Action == NotifyCollectionChangedAction.Add && e.NewItems != null)
+        {
+            foreach (InterpSegment segment in e.NewItems) AttachSegment(segment);
+        }
+        else if (e.Action == NotifyCollectionChangedAction.Remove && e.OldItems != null)
+        {
+            foreach (InterpSegment segment in e.OldItems) DetachSegment(segment);
+        }
+        else if (e.Action == NotifyCollectionChangedAction.Reset)
+        {
+            foreach (InterpSegment segment in _chatBySegment.Keys)
+                segment.PropertyChanged -= OnSegmentPropertyChanged;
+            _chatBySegment.Clear();
+        }
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private void AttachSegment(InterpSegment segment)
+    {
+        var chat = new ChatMessage
+        {
+            Source = segment.Source,
+            Translation = segment.Translation,
+            Speaker = segment.SpeakerName,
+            Direction = segment.DirectionText,
+            EngineNote = segment.EngineNote,
+            StateText = segment.StateText,
+            StateBack = segment.StateBack,
+            StateForeground = segment.StateForeground,
+            TranslationForeground = segment.TranslationBrush,
+            TimingText = segment.TimingText,
+            MatchedSource = segment.MatchedSource
+        };
+        _chatBySegment[segment] = chat;
+        ChatMessages.Add(chat);
+        segment.PropertyChanged += OnSegmentPropertyChanged;
+    }
+
+    private void OnSegmentPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (sender is not InterpSegment segment || !_chatBySegment.TryGetValue(segment, out var chat))
+            return;
+
+        switch (e.PropertyName)
+        {
+            case nameof(InterpSegment.Source): chat.Source = segment.Source; break;
+            case nameof(InterpSegment.Translation): chat.Translation = segment.Translation; break;
+            case nameof(InterpSegment.SpeakerName): chat.Speaker = segment.SpeakerName; break;
+            case nameof(InterpSegment.DirectionText): chat.Direction = segment.DirectionText; break;
+            case nameof(InterpSegment.EngineNote): chat.EngineNote = segment.EngineNote; break;
+            case nameof(InterpSegment.StateText): chat.StateText = segment.StateText; break;
+            case nameof(InterpSegment.StateBack): chat.StateBack = segment.StateBack; break;
+            case nameof(InterpSegment.StateForeground): chat.StateForeground = segment.StateForeground; break;
+            case nameof(InterpSegment.TranslationBrush): chat.TranslationForeground = segment.TranslationBrush; break;
+            case nameof(InterpSegment.TimingText): chat.TimingText = segment.TimingText; break;
+            case nameof(InterpSegment.MatchedSource): chat.MatchedSource = segment.MatchedSource; break;
+        }
+    }
+
+    private void DetachSegment(InterpSegment segment)
+    {
+        segment.PropertyChanged -= OnSegmentPropertyChanged;
+        if (_chatBySegment.Remove(segment, out var chat)) ChatMessages.Remove(chat);
+    }
+
+    private void AddSystem(string text)
+    {
+        if (!_dispatcher.CheckAccess())
+        {
+            _dispatcher.BeginInvoke(new Action(() => AddSystem(text)));
+            return;
+        }
+        ChatMessages.Add(new ChatMessage { IsSystem = true, Text = text });
+    }
+
+    public void AutoStart()
+    {
+        if (_autoStarted) return;
+        _autoStarted = true;
+        AddSystem("离线同传机器人已启动。直接说话即可；输入 /help 查看命令，右上角可做无声模拟测试。");
+        Start();
+    }
+
+    private async Task RunSimulationTestAsync()
+    {
+        if (_simulationTestRunning || _restarting || IsStopping) return;
+
+        _simulationTestRunning = true;
+        _testingSimulation = true;
+        NotifySimulationTestChanged();
+        bool wasRunning = IsRunning;
+
+        try
+        {
+            AddSystem("开始模拟测试：内置语音，不占麦克风、不发声，结束后自动恢复真实输入。");
+            await RestartAsync("正在启动模拟测试。");
+            await Task.Delay(TimeSpan.FromSeconds(20));
+        }
+        finally
+        {
+            _testingSimulation = false;
+
+            if (wasRunning)
+                await RestartAsync("模拟测试结束，恢复真实输入。");
+            else
+                AddSystem("模拟测试结束。");
+
+            _simulationTestRunning = false;
+            NotifySimulationTestChanged();
+        }
+    }
+
+    private void NotifySimulationTestChanged()
+    {
+        OnPropertyChanged(nameof(IsSimulationTestRunning));
+        OnPropertyChanged(nameof(SimulationTestButtonText));
+        OnPropertyChanged(nameof(SubtitleMeta));
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private async Task SendAsync()
+    {
+        string text = CommandText.Trim();
+        if (text.Length == 0) return;
+        CommandText = string.Empty;
+
+        if (!text.StartsWith('/'))
+        {
+            await TranslateTypedAsync(text);
+            return;
+        }
+        await ExecuteCommandAsync(text);
+    }
+
+    private async Task TranslateTypedAsync(string text)
+    {
+        var session = _session;
+        if (session == null)
+        {
+            AddSystem("当前未运行，输入 /start 启动。");
+            return;
+        }
+
+        var chat = new ChatMessage
+        {
+            Source = text,
+            Speaker = "你（输入）",
+            Direction = AutoLanguage ? "自动中/英" : DirectionLabel,
+            Translation = "…",
+            StateText = "翻译中",
+            StateBack = ChatMessage.WorkingBack,
+            StateForeground = ChatMessage.WorkingForeground,
+            TranslationForeground = ChatMessage.DefaultText
+        };
+        ChatMessages.Add(chat);
+
+        try
+        {
+            var (result, language) = await session.TranslateTextAsync(text, CancellationToken.None);
+            chat.Direction = language == "zh" ? "中文 → English" : "English → 中文";
+            if (result == null)
+            {
+                chat.Translation = "（没有翻译结果）";
+                chat.StateText = "未完成";
+                chat.StateBack = ChatMessage.FailedBack;
+                chat.StateForeground = ChatMessage.FailedForeground;
+                chat.TranslationForeground = ChatMessage.FailedForeground;
+                return;
+            }
+
+            chat.Translation = result.Text;
+            chat.EngineNote = result.MatchScore > 0
+                ? $"{result.Engine} {result.MatchScore:P0}"
+                : result.Engine;
+            chat.MatchedSource = result.MatchedSource;
+            chat.StateText = "已完成";
+            chat.StateBack = ChatMessage.DoneBack;
+            chat.StateForeground = ChatMessage.DoneForeground;
+        }
+        catch (Exception ex)
+        {
+            chat.Translation = "翻译失败：" + ex.Message;
+            chat.StateText = "未完成";
+            chat.StateBack = ChatMessage.FailedBack;
+            chat.StateForeground = ChatMessage.FailedForeground;
+            chat.TranslationForeground = ChatMessage.FailedForeground;
+        }
+    }
+
+    private async Task ExecuteCommandAsync(string line)
+    {
+        string[] parts = line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        string command = parts[0].ToLowerInvariant();
+        string arg = parts.Length > 1 ? parts[1] : string.Empty;
+        bool? onOff = ParseOnOff(arg);
+
+        switch (command)
+        {
+            case "/help":
+                AddSystem(HelpText);
+                break;
+            case "/status":
+                AddSystem(BuildStatus());
+                break;
+            case "/devices":
+                AddSystem(BuildDevices());
+                break;
+            case "/lang":
+                await ChangeLanguageAsync(arg);
+                break;
+            case "/speaker":
+                if (onOff == null) { AddSystem("用法：/speaker on|off"); break; }
+                Diarization = onOff.Value;
+                await RestartAsync($"声纹分人：{(Diarization ? "开" : "关")}，正在重启。");
+                break;
+            case "/sim":
+                if (onOff == null) { AddSystem("用法：/sim on|off"); break; }
+                SimulationMode = onOff.Value;
+                await RestartAsync(SimulationMode ? "模拟输入开启：无声演示，正在重启。" : "模拟输入关闭，正在重启。");
+                break;
+            case "/tts":
+                if (onOff == null) { AddSystem("用法：/tts on|off"); break; }
+                IsMuted = !onOff.Value;
+                AddSystem(SimulationMode
+                    ? "模拟输入始终无声，TTS 开关不影响演示。"
+                    : $"朗读已{(IsMuted ? "关闭" : "开启")}。");
+                break;
+            case "/volume":
+                if (!int.TryParse(arg, out int volume) || volume < 0 || volume > 100)
+                {
+                    AddSystem("用法：/volume 0-100");
+                    break;
+                }
+                Volume = volume / 100.0;
+                AddSystem(SimulationMode ? "模拟输入音量固定为 0。" : $"音量 {volume}%。");
+                break;
+            case "/rate":
+                if (!int.TryParse(arg, out int rate) || rate < -5 || rate > 5)
+                {
+                    AddSystem("用法：/rate -5..5");
+                    break;
+                }
+                SapiRate = rate;
+                await RestartAsync($"语速 {rate}，正在重启。");
+                break;
+            case "/sens":
+                int? sensitivity = arg.ToLowerInvariant() switch
+                {
+                    "low" or "低" => 0,
+                    "mid" or "中" => 1,
+                    "high" or "高" => 2,
+                    _ => null
+                };
+                if (sensitivity == null) { AddSystem("用法：/sens low|mid|high"); break; }
+                SensitivityIndex = sensitivity.Value;
+                await RestartAsync($"打断灵敏度：{arg}，正在重启。");
+                break;
+            case "/hold":
+                if (!int.TryParse(arg, out int hold) || hold < 80 || hold > 400)
+                {
+                    AddSystem("用法：/hold 80-400");
+                    break;
+                }
+                HoldMs = hold;
+                await RestartAsync($"判定窗口 {hold} ms，正在重启。");
+                break;
+            case "/drop":
+                if (onOff == null) { AddSystem("用法：/drop on|off"); break; }
+                DropPending = onOff.Value;
+                await RestartAsync($"被打断后丢弃未读译文：{(DropPending ? "开" : "关")}，正在重启。");
+                break;
+            case "/wait":
+                if (onOff == null) { AddSystem("用法：/wait on|off"); break; }
+                PauseWhileSpeaking = onOff.Value;
+                await RestartAsync($"对方说话时等停顿再朗读：{(PauseWhileSpeaking ? "开" : "关")}，正在重启。");
+                break;
+            case "/mic":
+                await ChangeDeviceAsync(arg, input: true);
+                break;
+            case "/out":
+                await ChangeDeviceAsync(arg, input: false);
+                break;
+            case "/restart":
+                await RestartAsync("正在重启。");
+                break;
+            case "/stop":
+                if (!IsRunning) { AddSystem("当前未运行。"); break; }
+                Stop();
+                AddSystem("已暂停。输入 /start 继续。");
+                break;
+            case "/start":
+                if (IsRunning) { AddSystem("已在运行。"); break; }
+                Start();
+                break;
+            case "/clear":
+                ChatMessages.Clear();
+                _chatBySegment.Clear();
+                AddSystem("聊天已清空。");
+                break;
+            default:
+                AddSystem($"未知命令 {command}。输入 /help 查看命令。");
+                break;
+        }
+    }
+
+    private async Task ChangeLanguageAsync(string arg)
+    {
+        string value = arg.ToLowerInvariant();
+        switch (value)
+        {
+            case "auto":
+                AutoLanguage = true;
+                await RestartAsync("方向：自动中/英，正在重启。");
+                break;
+            case "zh-en":
+            case "zh":
+                AutoLanguage = false;
+                DirectionIndex = 0;
+                await RestartAsync("方向：中文 → English，正在重启。");
+                break;
+            case "en-zh":
+            case "en":
+                AutoLanguage = false;
+                DirectionIndex = 1;
+                await RestartAsync("方向：English → 中文，正在重启。");
+                break;
+            default:
+                AddSystem("用法：/lang auto|zh-en|en-zh");
+                break;
+        }
+    }
+
+    private async Task ChangeDeviceAsync(string arg, bool input)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            AddSystem(input ? "用法：/mic 名称片段" : "用法：/out 名称片段");
+            return;
+        }
+
+        if (input)
+        {
+            var device = MicDevices.FirstOrDefault(d =>
+                d.Name.Contains(arg, StringComparison.OrdinalIgnoreCase));
+            if (device == null) { AddSystem($"找不到输入设备：{arg}。输入 /devices 查看列表。"); return; }
+            SelectedMic = device;
+            await RestartAsync($"输入切换为：{device.Name}，正在重启。");
+        }
+        else
+        {
+            var device = OutputDevices.FirstOrDefault(d =>
+                d.Name.Contains(arg, StringComparison.OrdinalIgnoreCase));
+            if (device == null) { AddSystem($"找不到输出设备：{arg}。输入 /devices 查看列表。"); return; }
+            SelectedOutput = device;
+            await RestartAsync($"输出切换为：{device.Name}，正在重启。");
+        }
+    }
+
+    private async Task RestartAsync(string reason)
+    {
+        if (_restarting) { AddSystem("正在重启，请稍候。"); return; }
+        _restarting = true;
+        AddSystem(reason);
+        try
+        {
+            if (IsRunning)
+            {
+                Stop();
+                while (IsStopping) await Task.Delay(120);
+            }
+            await Task.Delay(250);
+            Start();
+        }
+        finally
+        {
+            _restarting = false;
+        }
+    }
+
+    private static bool? ParseOnOff(string value)
+        => value.ToLowerInvariant() switch
+        {
+            "on" or "1" or "开" => true,
+            "off" or "0" or "关" => false,
+            _ => null
+        };
+
+    private string BuildStatus()
+    {
+        var lines = new List<string>
+        {
+            $"运行：{(IsRunning ? StateText : (IsStopping ? "停止中" : "已暂停"))}",
+            $"方向：{(AutoLanguage ? "自动中/英" : DirectionLabel)}",
+            $"声纹分人：{(Diarization ? "开" : "关")}",
+            $"输入：{SelectedMic?.Name ?? "—"}",
+            $"输出：{SelectedOutput?.Name ?? "—"}",
+            $"朗读：{(IsMuted ? "关" : $"开 · {Volume:P0}")}",
+            $"模拟输入：{(SimulationMode ? "开（无声）" : "关")}",
+            $"灵敏度：{SensitivityIndex} · 判定窗口：{HoldMs:0} ms",
+            $"知识库：{_kbPairs:N0} 句对 / {_kbTerms:N0} 术语",
+            $"离线资产：{OfflineInfo}",
+            $"统计：{StatsText}"
+        };
+        return string.Join("\n", lines);
+    }
+
+    private string BuildDevices()
+    {
+        var lines = new List<string> { "输入设备：" };
+        lines.AddRange(MicDevices.Select(d => "· " + d.Name));
+        lines.Add("输出设备：");
+        lines.AddRange(OutputDevices.Select(d => "· " + d.Name));
+        lines.Add("用法：/mic 名称片段，/out 名称片段");
+        return string.Join("\n", lines);
+    }
+
+    private const string HelpText = """
+        /help  命令列表
+        /lang auto|zh-en|en-zh  语种与方向
+        /speaker on|off  声纹分人
+        /sim on|off  模拟输入（无声、不用麦克风）
+        /tts on|off  朗读开关
+        /volume 0-100  音量
+        /rate -5..5  语速
+        /sens low|mid|high  打断灵敏度
+        /hold 80-400  人声判定窗口(ms)
+        /drop on|off  被打断后丢弃未读译文
+        /wait on|off  对方说话时等停顿再朗读
+        /mic 名称片段  切换输入
+        /out 名称片段  切换输出
+        /devices  列出设备
+        /status  当前状态
+        /start /stop /restart
+        /clear  清空聊天
+        直接输入文字：离线翻译
+        """;
+
     // —— 启停 ——
     private void Start()
     {
@@ -636,11 +1109,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
         string voiceEn = SelectedVoice?.Culture.StartsWith("en", StringComparison.OrdinalIgnoreCase) == true
             ? selectedName : defaultEn;
 
+        bool simulate = SimulationMode || _testingSimulation;
+
         var options = new SessionOptions
         {
             Mic = SelectedMic ?? new AudioDevice { Name = "模拟输入", Id = "simulation" },
             Output = SelectedOutput,
-            Engine = IsOnline ? EngineKind.Online : EngineKind.Offline,
+            Engine = EngineKind.Offline,
             Direction = DirectionIndex == 0 ? TranslateDirection.ZhToEn : TranslateDirection.EnToZh,
             ApiBase = ApiBase.Trim(),
             ApiKey = ApiKey.Trim(),
@@ -649,17 +1124,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             VoiceName = selectedName,
             VoiceZh = voiceZh,
             VoiceEn = voiceEn,
-            AutoLanguage = !IsOnline && AutoLanguage,
-            Diarization = !IsOnline && Diarization,
+            AutoLanguage = AutoLanguage,
+            Diarization = Diarization,
             SapiRate = (int)Math.Round(SapiRate),
             Sensitivity = SensitivityIndex,
             HoldMs = (int)Math.Round(HoldMs),
             EarphoneMode = AudioRouteIndex == 0,
             DropPendingOnBargeIn = DropPending,
             WaitForSilence = PauseWhileSpeaking,
-            Muted = SimulationMode ? false : IsMuted,
-            Volume = SimulationMode ? 0f : (float)Volume,
-            Simulation = SimulationMode
+            Muted = simulate ? false : IsMuted,
+            Volume = simulate ? 0f : (float)Volume,
+            Simulation = simulate
         };
 
         Segments.Clear();
@@ -675,7 +1150,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 });
             session.Notice += text =>
             {
-                try { _dispatcher.BeginInvoke(new Action(() => ShowToast(text, "error"))); }
+                try { _dispatcher.BeginInvoke(new Action(() => AddSystem(text))); }
                 catch { }
             };
             session.BargeIn += () =>
@@ -690,14 +1165,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _sessionStartedUtc = DateTime.UtcNow;
             _micWarningShown = false;
             SetState("监听中 · 等待说话", DeepTeal);
-            ShowToast(SimulationMode
-                ? "模拟输入已启动：内置语音演示，不发出声音。"
-                : (IsOnline ? "已开始同传（在线引擎）。" : "已开始同传（离线演示）。"), "ok");
+            AddSystem(_testingSimulation
+                ? "已启动：模拟测试（无声）。"
+                : simulate
+                    ? "已启动：模拟输入（无声）。"
+                    : $"已启动：{(AutoLanguage ? "自动中/英" : DirectionLabel)} · 声纹{(Diarization ? "开" : "关")} · 朗读{(IsMuted ? "关" : "开")}");
         }
         catch (Exception ex)
         {
             _session = null;
-            ShowToast($"启动失败：{ex.Message}", "error");
+            AddSystem($"启动失败：{ex.Message}");
             SetState("已停止", Slate);
         }
     }
@@ -757,12 +1234,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var session = _session;
         if (session == null) return;
 
-        if (!SimulationMode && !_micWarningShown
+        if (!IsSimulatedSession && !_micWarningShown
             && (DateTime.UtcNow - _sessionStartedUtc).TotalSeconds > 2
             && session.MicRms < 1e-5f)
         {
             _micWarningShown = true;
-            ShowToast("麦克风没有信号：请在右侧换一个输入设备，或勾选「模拟输入」。", "warn");
+            AddSystem("麦克风没有信号。输入 /devices 查看设备，用 /mic 名称片段切换，或 /sim on 无声演示。");
         }
 
         MicLevel = Smooth(MicLevel, LevelOf(session.MicRms));
