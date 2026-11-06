@@ -16,4 +16,4 @@
 要不要把这段改成B站视频口播稿？
 
 <img width="635" height="764" alt="a96efb73d6a7ec2c819d7cea92950c94" src="https://github.com/user-attachments/assets/cf3d4693-572b-4ac6-bfea-a74ea5306a85" />
-<img width="635" height="764" alt="a96efb73d6a7ec2c819d7cea92950c94" src="https://github.com/user-attachments/assets/57272bd5-0986-416a-83db-e8e5eb8180ba" />
+![Uploading e9839eabe5f271bd0329d92b8179c479.png…]()
